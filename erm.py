@@ -6,6 +6,7 @@ from dataclasses import MISSING
 from pkgutil import iter_modules
 import re
 from collections import defaultdict
+import asyncio
 
 from datamodels.MapleKeys import MapleKeys
 from datamodels.Whitelabel import Whitelabel
@@ -21,17 +22,15 @@ from tasks.change_status import change_status
 from tasks.check_whitelisted_car import check_whitelisted_car
 from tasks.sync_weather import sync_weather
 from tasks.iterate_conditions import iterate_conditions
+from tasks.prc_automations import prc_automations
+from tasks.mc_discord_checks import mc_discord_checks
+from utils.accounts import Accounts
 from utils.emojis import EmojiController
 
 from utils.log_tracker import LogTracker
 from utils.mc_api import MCApiClient
 from utils.mongo import Document
 
-try:
-    import Levenshtein
-    from fuzzywuzzy import fuzz, process
-except ImportError:
-    from fuzzywuzzy import fuzz, process
 import aiohttp
 import decouple
 import discord.mentions
@@ -79,6 +78,26 @@ from utils.constants import *
 import utils.prc_api
 
 
+_global_fetch_semaphore = asyncio.Semaphore(45)
+_fetch_delays = defaultdict(float)
+
+async def rate_limited_fetch(coro, endpoint_type="default"):
+    """Rate-limited wrapper for Discord API calls"""
+    async with _global_fetch_semaphore:
+        if _fetch_delays[endpoint_type] > 0:
+            await asyncio.sleep(_fetch_delays[endpoint_type])
+        
+        try:
+            result = await coro
+            _fetch_delays[endpoint_type] = max(0, _fetch_delays[endpoint_type] - 0.1)
+            return result
+        except discord.HTTPException as e:
+            if e.status == 429:
+                _fetch_delays[endpoint_type] = min(_fetch_delays[endpoint_type] + 0.5, 5.0)
+                if e.retry_after:
+                    await asyncio.sleep(e.retry_after)
+            raise
+
 setup = False
 
 try:
@@ -108,6 +127,9 @@ class Bot(commands.AutoShardedBot):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.setup_status: bool = False
+        self._member_cache = {}
+        self._guild_cache = {}
+        self._cache_timeout = 300
 
     async def close(self):
         for session in self.external_http_sessions:
@@ -121,7 +143,7 @@ class Bot(commands.AutoShardedBot):
         # IDs are a security vulnerability.
 
         # Else fall back to the original
-        if user.id == 1165311055728226444:
+        if user.id == 1394817794427846737:
             return True
 
         if environment != "CUSTOM": # let's not allow custom bot owners to use jishaku lol
@@ -133,7 +155,6 @@ class Bot(commands.AutoShardedBot):
         self.external_http_sessions: list[aiohttp.ClientSession] = []
         self.view_state_manager: ViewStateManager = ViewStateManager()
 
-        global setup
         if not self.setup_status:
             # await bot.load_extension('utils.routes')
             logging.info(
@@ -147,11 +168,13 @@ class Bot(commands.AutoShardedBot):
             elif environment == "PRODUCTION":
                 self.db = self.mongo["erm"]
             elif environment == "ALPHA":
-                self.db = self.mongo["alpha"]
+                self.db = self.mongo["erm"]
             elif environment == "CUSTOM":
                 self.db = self.mongo["erm"]
             else:
                 raise Exception("Invalid environment")
+            
+
 
             self.panel_db = self.mongo["UserIdentity"]
             self.priority_settings = Document(self.panel_db, "PrioritySettings")
@@ -195,6 +218,15 @@ class Bot(commands.AutoShardedBot):
 
             self.pending_oauth2 = PendingOAuth2(self.db, "pending_oauth2")
             self.oauth2_users = OAuth2Users(self.db, "oauth2")
+
+            self.accounts = Accounts(self)
+
+            if environment == "CUSTOM":
+                doc = await self.whitelabel.db.find_one({"GuildID": config("CUSTOM_GUILD_ID", default="0")})
+                if not doc:
+                    raise Exception(
+                        "Custom guild ID not found in the database. This means the whitelabel subscription is overdue."
+                    )
 
             self.roblox = roblox.Client()
             self.prc_api = PRCApiClient(
@@ -280,18 +312,47 @@ class Bot(commands.AutoShardedBot):
     async def start_tasks(self):
         logging.info("Starting tasks...")
         check_reminders.start(bot)
+        logging.info("Startng the Check Reminders task...")
+        await asyncio.sleep(30)
         check_loa.start(bot)
+        logging.info("Starting the Check LOA task...")
+        await asyncio.sleep(30)
         iterate_ics.start(bot)
+        logging.info("Starting the Iterate ICS task...")
+        await asyncio.sleep(30)
         iterate_prc_logs.start(bot)
+        logging.info("Starting the Iterate PRC Logs task...")
+        await asyncio.sleep(30)
         statistics_check.start(bot)
+        logging.info("Starting the Statistics Check task...")
+        await asyncio.sleep(30)
         tempban_checks.start(bot)
+        logging.info("Starting the Tempban Checks task...")
+        await asyncio.sleep(30)
         check_whitelisted_car.start(bot)
+        logging.info("Starting the Check Whitelisted Car task...")
         if self.environment != "CUSTOM":
+            await asyncio.sleep(30)
             change_status.start(bot)
+        logging.info("Starting the Change Status task...")
+        await asyncio.sleep(30)
         process_scheduled_pms.start(bot)
+        logging.info("Starting the Process Scheduled PMs task...")
+        await asyncio.sleep(30)
         sync_weather.start(bot)
+        logging.info("Starting the Sync Weather task...")
+        await asyncio.sleep(30)
         iterate_conditions.start(bot)
+        logging.info("Starting the Iterate Conditions task...")
+        await asyncio.sleep(30)
         check_infractions.start(bot)
+        logging.info("Starting the Check Infractions task...")
+        await asyncio.sleep(30)
+        prc_automations.start(bot)
+        logging.info("Starting the ER:LC Discord Checks task...")
+        await asyncio.sleep(30)
+        mc_discord_checks.start(bot)
+        logging.info("Starting the MC Discord Checks task...")
         logging.info("All tasks are now running!")
 
 
@@ -307,7 +368,6 @@ bot = Bot(
         replied_user=False, everyone=False, roles=False
     ),
 )
-bot.debug_servers = [987798554972143728]
 bot.is_synced = False
 bot.shift_management_disabled = False
 bot.punishments_disabled = False
@@ -346,23 +406,19 @@ async def AutoDefer(ctx: commands.Context):
                 raise Exception(f"Guild not permitted to use this bot: {ctx.guild.id}")
 
     guild_id = ctx.guild.id
-    doc = await bot.whitelabel.db.find_one({"GuildID": guild_id})
-    if doc:
-        # must be a whitelabel instance. are we the whitelabel instance?
-        if environment == "CUSTOM" and int(config("CUSTOM_GUILD_ID")) == guild_id:
-            pass  # we are the whitelabel instance, we're fine.
-        else:
-            # we aren't the whitelabel instance!
-            if ctx.interaction:
-                await ctx.interaction.response.send_message(
-                    embed=discord.Embed(
-                        title="Not Permitted",
-                        description="There is a whitelabel bot already in this server.",
-                        color=BLANK_COLOR,
-                    ),
-                    ephemeral=True,
-                )
-            raise Exception("Whitelabel bot already in use")
+    if (environment != "CUSTOM" or int(config("CUSTOM_GUILD_ID", default="0")) != guild_id) and await has_whitelabel(bot, guild_id):
+        if "jishaku" in ctx.command.qualified_name:
+            return
+        if ctx.interaction:
+            await ctx.interaction.response.send_message(
+                embed=discord.Embed(
+                    title="Not Permitted",
+                    description="There is a whitelabel bot already in this server.",
+                    color=BLANK_COLOR,
+                ),
+                ephemeral=True,
+            )
+        raise Exception("Whitelabel bot already in use")
 
     internal_command_storage[ctx] = datetime.datetime.now(tz=pytz.UTC).timestamp()
     if ctx.command:
@@ -424,7 +480,7 @@ async def on_message(
                 )
                 return
 
-    if environment == "PRODUCTION" and await bot.whitelabel.db.find_one({"GuildID": message.guild.id}) is not None:
+    if environment == "PRODUCTION" and await bot.whitelabel.db.find_one({"GuildID": str(message.guild.id)}) is not None:
         return
 
     await bot.process_commands(message)
@@ -447,6 +503,10 @@ async def staff_check(bot_obj, guild, member):
                         role.id for role in member.roles
                     ]:
                         return True
+                    
+    if await admin_check(bot_obj, guild, member):
+        return True
+    
     if member.guild_permissions.manage_messages:
         return True
     return False

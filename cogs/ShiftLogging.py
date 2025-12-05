@@ -1,6 +1,7 @@
 import datetime
 from io import BytesIO
 import logging
+import typing
 
 import discord
 import pytz
@@ -58,7 +59,10 @@ class ShiftLogging(commands.Cog):
     @require_settings()
     @app_commands.describe(member = "The staff member to view shifts for.", shift_type="The type of shift to view.")
     @app_commands.autocomplete(shift_type=shift_type_autocomplete)
-    async def duty_time(self, ctx, member: discord.Member = None, shift_type: str = "Default"):
+    async def duty_time(self, ctx, member: typing.Optional[discord.Member] = None, shift_type: str = "Default"):
+        if isinstance(member, str) and not shift_type:
+            shift_type = member
+            member = None
         if self.bot.shift_management_disabled:
             return await new_failure_embed(
                 ctx,
@@ -101,7 +105,7 @@ class ShiftLogging(commands.Cog):
                     return
                 shift_type_value = view.value.lower()
 
-        if shift_type_value == "all":
+        if shift_type_value.lower() == "all" or shift_type_value.lower() == "default":
             selected_shift_type = None
         else:
             selected_shift_type = next((st for st in shift_types if st["name"].lower() == shift_type_value), None)
@@ -249,8 +253,6 @@ class ShiftLogging(commands.Cog):
                                     ),
                                     view=None,
                                 )
-                        elif access is False and force.lower() == "true":
-                            pass
 
         shift = await self.bot.shift_management.get_current_shift(member, ctx.guild.id)
         await log_command_usage(
@@ -691,11 +693,8 @@ class ShiftLogging(commands.Cog):
                         if shift_list:
                             shift_type = shift_list[0]
                         else:
-                            return await new_failure_embed(
-                                ctx,
-                                "Critical Error",
-                                "if you somehow encounter this error, please contact [ERM Support](https://discord.gg/FAC629TzBy)",
-                            )
+                            shift_type = None # default to None - instead of error
+
                 else:
                     return
 
@@ -717,7 +716,12 @@ class ShiftLogging(commands.Cog):
                 {"Guild": ctx.guild.id, "EndEpoch": 0}
             ):
                 if sh["Guild"] == ctx.guild.id:
-                    member = discord.utils.get(ctx.guild.members, id=sh["UserID"])
+                    member = ctx.guild.get_member(sh["UserID"])
+                    if not member:
+                        try: 
+                            member = await ctx.guild.fetch_member(sh["UserID"])
+                        except discord.NotFound:
+                            continue
                     if member:
                         if member not in staff_members:
                             staff_members.append(member)
@@ -726,7 +730,12 @@ class ShiftLogging(commands.Cog):
                 {"Guild": ctx.guild.id, "Type": shift_type["name"], "EndEpoch": 0}
             ):
                 s = shift
-                member = discord.utils.get(ctx.guild.members, id=shift["UserID"])
+                member = ctx.guild.get_member(shift["UserID"])
+                if not member:
+                    try:
+                        member = await ctx.guild.fetch_member(shift["UserID"])
+                    except discord.NotFound:
+                        continue
                 if member:
                     if member not in staff_members:
                         staff_members.append(member)
@@ -757,10 +766,14 @@ class ShiftLogging(commands.Cog):
         added_staff = []
         for index, staff in enumerate(sorted_staff):
             # # print(staff)
-            member = discord.utils.get(ctx.guild.members, id=staff["id"])
+            member = ctx.guild.get_member(staff["id"])
             if not member:
-                continue
-
+                try:
+                    member = await ctx.guild.fetch_member(staff["id"])
+                except discord.NotFound:
+                    index -= 1
+                    continue
+            
             if (
                 len((embeds[-1].description or "").splitlines()) >= 16
                 and member.id not in added_staff
@@ -897,14 +910,10 @@ class ShiftLogging(commands.Cog):
                             for i in shift_types
                             if i["name"].lower() == shift_type_str.lower()
                         ]
-                        if shift_list:
+                        if len(shift_list) > 0:
                             shift_type = shift_list[0]
                         else:
-                            return await new_failure_embed(
-                                ctx,
-                                "Critical Error",
-                                "if you somehow encounter this error, please contact [ERM Support](https://discord.gg/FAC629TzBy)",
-                            )
+                            shift_type = shift_types[0] # default to zero - instead of error
                 else:
                     return
 
@@ -1148,12 +1157,12 @@ class ShiftLogging(commands.Cog):
                             if len((embeds[-1].description or "").splitlines()) < 16:
                                 if embeds[-1].description is None:
                                     embeds[-1].description = (
-                                        f"**Total Shifts**\n**{index + 1}.** {member.mention} • {td_format(datetime.timedelta(seconds=0))}\n"
+                                        f"**Total Shifts**\n> **{index + 1}.** {member.mention} • {td_format(datetime.timedelta(seconds=0))}\n"
                                     )
                                 else:
                                     embeds[
                                         -1
-                                    ].description += f"**{index + 1}.** {member.mention} • {td_format(datetime.timedelta(seconds=0))}\n"
+                                    ].description += f"> **{index + 1}.** {member.mention} • {td_format(datetime.timedelta(seconds=0))}\n"
 
                             else:
                                 new_embed = discord.Embed(
@@ -1165,7 +1174,7 @@ class ShiftLogging(commands.Cog):
                                     icon_url=ctx.guild.icon,
                                 )
                                 new_embed.description = ""
-                                new_embed.description += f"**Total Shifts**\n**{index + 1}.** {member.mention} - {td_format(datetime.timedelta(seconds=0))}\n"
+                                new_embed.description += f"**Total Shifts**\n> **{index + 1}.** {member.mention} - {td_format(datetime.timedelta(seconds=0))}\n"
                                 embeds.append(new_embed)
         perm_staff = list(
             filter(

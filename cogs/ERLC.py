@@ -5,14 +5,14 @@ import re
 import discord
 import roblox
 from discord.ext import commands
-from utils.autocompletes import erlc_players_autocomplete
+from utils.autocompletes import erlc_group_autocomplete, erlc_players_autocomplete
 from roblox.thumbnails import AvatarThumbnailType 
 
 import logging
 from typing import List
-from erm import is_staff, is_management
+from erm import admin_check, is_staff, is_management, management_predicate
 from utils.paginators import CustomPage, SelectPagination
-from menus import ReloadView, RefreshConfirmation, RiskyUsersMenu
+from menus import CustomModal, ReloadView, RefreshConfirmation, RiskyUsersMenu, CustomExecutionButton
 import copy
 from utils.constants import *
 from utils.prc_api import (
@@ -24,7 +24,7 @@ from utils.prc_api import (
     ResponseFailure,
 )
 import utils.prc_api as prc_api
-from utils.utils import get_discord_by_roblox, log_command_usage, secure_logging
+from utils.utils import get_discord_by_roblox, get_roblox_by_username, log_command_usage, secure_logging, staff_check
 from discord import app_commands
 import typing
 
@@ -352,12 +352,538 @@ class ERLC(commands.Cog):
 
         await ctx.send(embed=embed2)
 
+
+    @server.command(
+        name="panel",
+        description="Open a panel that allows you to manage a player in your server.",
+        aliases=["playerpanel", "manage"],
+    )
+    @app_commands.autocomplete(target=erlc_players_autocomplete)
+    @app_commands.describe(target="Who would you like to manage?")
+    @is_staff()
+    @is_server_linked()
+    async def erlc_panel(self, ctx: commands.Context, target: str):
+        target = await get_roblox_by_username(target, self.bot, ctx)
+        if not target or target.get("errors") is not None:
+            return await ctx.send(
+                embed=discord.Embed(
+                    title="Could not find player",
+                    description="I could not find a Roblox player with that username.",
+                    color=BLANK_COLOR,
+                )
+            )
+        target = target.get("username", target.get("name", ""))
+    
+        client = roblox.Client()
+        roblox_player = await client.get_user_by_username(target)
+
+        thumbnails = await client.thumbnails.get_user_avatar_thumbnails(
+            [roblox_player], type=AvatarThumbnailType.full_body, size="720x720"
+        )
+
+        server_staff = await self.bot.prc_api.get_server_staff(ctx.guild.id)
+        player_item = list(filter(lambda x: x.username.lower() == roblox_player.name.lower(), server_staff))
+        player_permission = ""
+        if len(player_item) == 0:
+            player_permission = "Normal"
+        else:
+            player_permission = player_item[0].permission
+        
+        server_players = await self.bot.prc_api.get_server_players(ctx.guild.id)
+        matched_players = list(filter(lambda x: x.username.lower() == roblox_player.name.lower(), server_players))
+        disable_online_buttons = False
+        erlc_player = None
+        if len(matched_players) == 0:
+            disable_online_buttons = True
+        else:
+            erlc_player = matched_players[0]
+
+        server_join_logs = await self.bot.prc_api.fetch_player_logs(ctx.guild.id)
+        matching_player_logs = list(filter(lambda x: x.username.lower() == roblox_player.name.lower(), server_join_logs))
+        vehicle_information = await self.bot.prc_api.get_server_vehicles(ctx.guild.id)
+        if len(vehicle_information) > 0:
+            vehicle_information = list(
+                filter(lambda x: x.username.lower() == roblox_player.name.lower(), vehicle_information)
+            )
+        else:
+            vehicle_information = []
+
+        kill_logs = await self.bot.prc_api.fetch_kill_logs(ctx.guild.id)
+        matching_kill_logs = list(
+            filter(lambda x: x.killer_username.lower() == roblox_player.name.lower() or x.killed_username.lower() == roblox_player.name.lower(), kill_logs)
+        )
+        
+        modcalls = await self.bot.prc_api.get_mod_calls(ctx.guild.id)
+        matching_modcalls = list(
+            filter(
+                lambda x: x.caller_username.lower() == roblox_player.name.lower() or (x.moderator_username and x.moderator_username.lower() == roblox_player.name.lower()), modcalls
+            )
+        )
+
+        command_logs = await self.bot.prc_api.fetch_server_logs(ctx.guild.id)
+        matching_command_logs = list(
+            filter(lambda x: x.username.lower() == roblox_player.name.lower(), command_logs)
+        )
+
+        newline = "\n" # backwards python compatibility
+
+        async def view_kills_callback(interaction: discord.Interaction, button: discord.ui.Button):
+            if not matching_kill_logs:
+                return await interaction.response.send_message(
+                    embed=discord.Embed(
+                        title="No Kills Found",
+                        description="This player has no kills in the server.",
+                        color=BLANK_COLOR,
+                    ),
+                    ephemeral=True,
+                )
+
+            killsContainer = discord.ui.Container(
+                discord.ui.TextDisplay(
+                    "\n".join(
+                    [
+                        f"> [{log.killer_username}](https://roblox.com/users/{log.killer_user_id}/profile) killed [{log.killed_username}](https://roblox.com/users/{log.killed_user_id}/profile) • <t:{log.timestamp}:F>"
+                        for log in matching_kill_logs
+                    ]
+                    )
+                )
+            )
+
+            await interaction.response.send_message(
+                view=discord.ui.LayoutView().add_item(killsContainer),
+                ephemeral=True
+            )
+
+        async def view_commands_callback(interaction: discord.Interaction, button: discord.ui.Button):
+            if not matching_command_logs:
+                return await interaction.response.send_message(
+                    embed=discord.Embed(
+                        title="No Commands Found",
+                        description="This player has no commands in the server.",
+                        color=BLANK_COLOR,
+                    ),
+                    ephemeral=True,
+                )
+
+            commandsContainer = discord.ui.Container(
+                discord.ui.TextDisplay(
+                    "\n".join(
+                        [
+                            f"> [{log.username}](https://roblox.com/users/{log.user_id}/profile) ran `{log.command}` • <t:{log.timestamp}:F>"
+                            for log in matching_command_logs
+                        ]
+                    )
+                )
+            )
+
+            await interaction.response.send_message(
+                view=discord.ui.LayoutView().add_item(commandsContainer),
+                ephemeral=True
+            )
+
+        async def view_modcalls_callback(interaction: discord.Interaction, button: discord.ui.Button):
+            if not matching_modcalls:
+                return await interaction.response.send_message(
+                    embed=discord.Embed(
+                        title="No Modcalls Found",
+                        description="This player has no modcalls in the server.",
+                        color=BLANK_COLOR,
+                    ),
+                    ephemeral=True,
+                )
+
+            modcallsContainer = discord.ui.Container(
+                discord.ui.TextDisplay(
+                    "\n".join(
+                        [
+                            f"> Caller: {call.caller} • Moderator: {call.moderator} • <t:{call.timestamp}:F>"
+                            for call in matching_modcalls
+                        ]
+                    )
+                )
+            )
+
+            await interaction.response.send_message(
+                view=discord.ui.LayoutView().add_item(modcallsContainer),
+                ephemeral=True
+            )
+
+        async def refresh_player_callback(interaction: discord.Interaction, button: discord.ui.Button):
+            if ctx.author != interaction.user:
+                return
+            
+            command_response = await self.bot.prc_api.run_command(
+                ctx.guild.id, f":refresh {roblox_player.name}"
+            )
+            if command_response[0] == 200:
+                return await interaction.response.send_message(
+                        embed=discord.Embed(
+                            title=f"{self.bot.emoji_controller.get_emoji('success')} Player Refreshed",
+                            description=f"The player {roblox_player.name} has been refreshed successfully.",
+                            color=GREEN_COLOR,
+                        ),
+                        ephemeral=True,
+                )
+            else:
+                return await interaction.response.send_message(
+                        embed=discord.Embed(
+                            title="Refresh Failed",
+                            description="The player could not be refreshed successfully.",
+                            color=BLANK_COLOR,
+                        ),
+                        ephemeral=True,
+                    )
+
+        async def respawn_player_callback(interaction: discord.Interaction, button: discord.ui.Button):
+            if ctx.author != interaction.user:
+                return
+            
+            command_response = await self.bot.prc_api.run_command(
+                ctx.guild.id, f":respawn {roblox_player.name}"
+            )
+            if command_response[0] == 200:
+                return await interaction.response.send_message(
+                        embed=discord.Embed(
+                            title=f"{self.bot.emoji_controller.get_emoji('success')} Player Respawned",
+                            description=f"The player {roblox_player.name} has been respawned successfully.",
+                            color=GREEN_COLOR,
+                        ),
+                        ephemeral=True,
+                )
+            else:
+                return await interaction.response.send_message(
+                        embed=discord.Embed(
+                            title="Respawn Failed",
+                            description="The player could not be respawned successfully.",
+                            color=BLANK_COLOR,
+                        ),
+                        ephemeral=True,
+                    )
+
+        async def teleport_to_callback(interaction: discord.Interaction, button: discord.ui.Button):
+            if ctx.author != interaction.user:
+                return
+
+            modal = CustomModal(
+                f"Teleport To Player",
+                [
+                    (
+                        "value",
+                        discord.ui.TextInput(
+                            label="Roblox Username",
+                            placeholder="Roblox Username (e.g. i_iMikey)",
+                            required=True,
+                        ),
+                    )
+                ]
+            )
+
+            await interaction.response.send_modal(modal)
+            await modal.wait()
+            username = modal.value.value
+            if not username:
+                return
+            
+            command_response = await self.bot.prc_api.run_command(
+                ctx.guild.id, (command := f":tp {username} {roblox_player.name}")
+            )
+            if command_response[0] == 200:
+                await interaction.followup.send(
+                    embed=discord.Embed(
+                        title=f"{self.bot.emoji_controller.get_emoji('success')} Teleported",
+                        description=f"The player {username} has been teleported to {roblox_player.name}.",
+                        color=GREEN_COLOR,
+                    ),
+                    ephemeral=True,
+                )
+                await self.secure_logging(
+                    ctx.guild.id, ctx.author.id, "Command", command
+                )
+            else:
+                await interaction.followup.send(
+                    embed=discord.Embed(
+                        title="Teleport Failed",
+                        description="The player could not be teleported.",
+                        color=BLANK_COLOR,
+                    ),
+                    ephemeral=True,
+                )
+                await self.secure_logging(
+                    ctx.guild.id, ctx.author.id, "Command", command
+                )
+
+        async def pm_player_callback(interaction: discord.Interaction, button: discord.ui.Button):
+            if ctx.author != interaction.user:
+                return
+            
+            modal = CustomModal(
+                f"PM Player",
+                [
+                    (
+                        "value",
+                        discord.ui.TextInput(
+                            label="Message",
+                            placeholder="What message would you like to send?",
+                            required=True,
+                        ),
+                    )
+                ]
+            )
+
+            await interaction.response.send_modal(modal)
+            await modal.wait()
+            message = modal.value.value
+            if not message:
+                return
+            
+            command_response = await self.bot.prc_api.run_command(
+                ctx.guild.id, (command := f":pm {target} {message}")
+            )
+            if command_response[0] == 200:
+                await interaction.followup.send(
+                    embed=discord.Embed(
+                        title=f"{self.bot.emoji_controller.get_emoji('success')} PM Sent",
+                        description=f"The message has been sent to {roblox_player.name}.",
+                        color=GREEN_COLOR,
+                    ),
+                    ephemeral=True,
+                )
+                await self.secure_logging(
+                    ctx.guild.id, ctx.author.id, "Command", command
+                )
+            else:
+                await interaction.followup.send(
+                    embed=discord.Embed(
+                        title="PM Failed",
+                        description="The message could not be sent to the player.",
+                        color=BLANK_COLOR,
+                    ),
+                    ephemeral=True,
+                )
+                await self.secure_logging(
+                    ctx.guild.id, ctx.author.id, "Command", command
+                )
+
+        
+        async def kick_player_callback(interaction: discord.Interaction, button: discord.ui.Button):            
+            if ctx.author != interaction.user:
+                return
+            
+            command_response = self.bot.prc_api.run_command(
+                ctx.guild.id, (command := f":kick {roblox_player.name}")
+            )
+            await self.secure_logging(
+                ctx.guild.id, ctx.author.id, "Command", command
+            )
+            if command_response[0] == 200:
+                return await interaction.response.send_message(
+                        embed=discord.Embed(
+                            title=f"{self.bot.emoji_controller.get_emoji('success')} Player Kicked",
+                            description=f"The player {roblox_player.name} has been kicked successfully.",
+                            color=GREEN_COLOR,
+                        ),
+                        ephemeral=True,
+                )
+
+            else:
+                return await interaction.response.send_message(
+                        embed=discord.Embed(
+                            title="Kick Failed",
+                            description="The player could not be kicked successfully.",
+                            color=BLANK_COLOR,
+                        ),
+                        ephemeral=True,
+                    )
+            
+        async def ban_player_callback(interaction: discord.Interaction, button: discord.ui.Button):
+            if ctx.author != interaction.user:
+                return
+            
+            if not await admin_check(self.bot, ctx.guild, ctx.author) and not await management_predicate(ctx):
+                return await interaction.response.send_message(
+                    embed=discord.Embed(
+                        title="Insufficient Permissions",
+                        description="You do not have permission to ban players.",
+                        color=BLANK_COLOR,
+                    ),
+                    ephemeral=True,
+                )
+
+            command_response = self.bot.prc_api.run_command(
+                ctx.guild.id, (command := f":ban {roblox_player.id}")
+            )
+            await self.secure_logging(
+                ctx.guild.id, ctx.author.id, "Command", command
+            )
+
+            if command_response[0] == 200:
+                return await interaction.response.send_message(
+                        embed=discord.Embed(
+                            title=f"{self.bot.emoji_controller.get_emoji('success')} Player Banned",
+                            description=f"The player {roblox_player.name} has been banned successfully.",
+                            color=GREEN_COLOR,
+                        ),
+                        ephemeral=True,
+                )
+            else:
+                return await interaction.response.send_message(
+                        embed=discord.Embed(
+                            title="Ban Failed",
+                            description="The player could not be banned successfully.",
+                            color=BLANK_COLOR,
+                        ),
+                        ephemeral=True,
+                    )
+        
+
+        class PanelContainer(discord.ui.Container):
+
+            section = discord.ui.Section(
+                accessory=discord.ui.Thumbnail(
+                    media=thumbnails[0].image_url if thumbnails else None
+             )
+            ).add_item(f"## {roblox_player.name}\n### User Information\n> **Username:** `{roblox_player.name}`\n> **User ID:** `{roblox_player.id}`\n> **Permission:** {player_permission}\n{'> **Team:** {}{}{}'.format(erlc_player.team, newline, '> **Callsign:** `{}`'.format(erlc_player.callsign) if erlc_player.callsign else '') if erlc_player else ''}")
+
+            if len(matching_player_logs) > 0:
+                section.add_item(
+                    f"### Timeline Information\n" + '\n'.join([f"> {'Joined' if log.type == 'join' else 'Left'} at <t:{log.timestamp}:F>" for log in matching_player_logs]))
+            else:
+                section.add_item("### Timeline Information\n> No activity logs found for this player.")
+            
+            if len(vehicle_information) > 0:
+                section.add_item(
+                    f"### Vehicle Information\n> **Vehicle:** {vehicle_information[0].vehicle}\n> **Livery:** {vehicle_information[0].texture}"
+                )
+            else:
+                section.add_item("### Vehicle Information\n> No active vehicle found for this player.")
+
+            log_actions = discord.ui.ActionRow(
+                CustomExecutionButton(ctx.author.id, label="View Kills", style=discord.ButtonStyle.gray, func=view_kills_callback),
+                CustomExecutionButton(ctx.author.id, label="View Commands", style=discord.ButtonStyle.gray, func=view_commands_callback),
+                CustomExecutionButton(ctx.author.id, label="View Modcalls", style=discord.ButtonStyle.gray, func=view_modcalls_callback),
+            )
+
+            active_actions = discord.ui.ActionRow(
+                CustomExecutionButton(ctx.author.id, label="Refresh Player", style=discord.ButtonStyle.gray, disabled=disable_online_buttons, func=refresh_player_callback),
+                CustomExecutionButton(ctx.author.id, label="Respawn Player", style=discord.ButtonStyle.gray, disabled=disable_online_buttons, func=respawn_player_callback),
+                CustomExecutionButton(ctx.author.id, label="PM Player", style=discord.ButtonStyle.gray, disabled=disable_online_buttons, func=pm_player_callback),
+                CustomExecutionButton(ctx.author.id, label="Teleport To Player", style=discord.ButtonStyle.gray, disabled=disable_online_buttons, func=teleport_to_callback),
+            )
+
+            destructive_actions = discord.ui.ActionRow(
+                CustomExecutionButton(ctx.author.id, label="Kick Player", style=discord.ButtonStyle.red, disabled=disable_online_buttons, func=kick_player_callback),
+                CustomExecutionButton(ctx.author.id, label="Ban Player", style=discord.ButtonStyle.red, func=ban_player_callback), # bans can be done offline
+            )
+
+        class TestView(discord.ui.LayoutView):
+            container = PanelContainer(id=1)
+
+        await ctx.send(view=TestView(timeout=None))
+    
+
+    @server.command(
+        name="modcalls",
+        description="View all modcalls in your ER:LC server!",
+    )
+    @is_server_linked()
+    @is_staff()
+    @app_commands.describe(
+        filter="Filter the modcalls by a specific username or user ID."
+    )
+    async def erlc_modcalls(self, ctx: commands.Context, filter: typing.Optional[str] = None):
+        guild_id = ctx.guild.id
+        modcalls = await self.bot.prc_api.get_mod_calls(guild_id)
+
+        if not modcalls:
+            return await ctx.send(
+                embed=discord.Embed(
+                    title="No Modcalls Found",
+                    description="There are no modcalls in this server.",
+                    color=BLANK_COLOR,
+                )
+            )
+
+        embed = discord.Embed(
+            title="Moderator Calls", color=BLANK_COLOR, description=""
+        )
+        embed.set_author(name=ctx.guild.name, icon_url=ctx.guild.icon or "")
+        pages = []
+        for call in modcalls:
+            val = f"> Caller: [{call.caller_username}](https://roblox.com/users/{call.caller_id}/profile) • Moderator: {'[{}](https://roblox.com/users/{}/profile)'.format(call.moderator_username, call.moderator_id) if call.moderator_id else 'n/a'} • <t:{call.timestamp}:t>\n"
+            if filter and (filter.lower() in val.lower()):
+                embed.description += val
+            elif not filter:
+                embed.description += val
+            if len(embed.description) > 2000:
+                pages.append(CustomPage(embeds=[embed], identifier=str(len(pages) + 1)))
+                embed = discord.Embed(
+                    title="Moderator Calls", color=BLANK_COLOR, description=""
+                )
+                embed.set_author(name=ctx.guild.name, icon_url=ctx.guild.icon or "")
+        
+        if len(pages) == 0:
+            if embed.description == "":
+                embed.description = "> No modcalls found."
+            await ctx.send(embed=embed)
+            return
+    
+        paginator = SelectPagination(self.bot, ctx.author.id, pages)
+        await ctx.send(
+            embed=pages[0].embeds[0],
+            view=paginator.get_current_view(),
+        )
+        
+    @server.command(
+        name="permissions",
+        description="View the permissions of players in your ER:LC server!",
+        aliases=["perm", "playerpermissions", "playerperms"],
+    )
+    @is_server_linked()
+    @is_staff()
+    @app_commands.describe(
+        filter="Filter the permissions by a specific role, username or user ID."
+    )
+    async def erlc_permissions(self, ctx: commands.Context, filter: typing.Optional[str] = None):
+        # use SelectPagination - sort by Server Co-Owner, Server Administrator, Server Moderator
+        pages = []
+        server_staff = await self.bot.prc_api.get_server_staff(ctx.guild.id)
+        embed = discord.Embed(
+            title="Server Permissions", color=BLANK_COLOR, description=""
+        )
+        embed.set_author(name=ctx.guild.name, icon_url=ctx.guild.icon or "")
+        for item in server_staff:
+            val = f"> [{item.username}](https://roblox.com/users/{item.id}/profile) - {item.permission}\n"
+            if filter and filter.lower() in val.lower():
+                embed.description += val
+            elif not filter:
+                embed.description += val
+            if len(embed.description) > 1000:
+                pages.append(CustomPage(embeds=[embed], identifier=str(len(pages) + 1)))
+                embed = discord.Embed(
+                    title="Server Permissions", color=BLANK_COLOR, description=""
+                )
+                embed.set_author(name=ctx.guild.name, icon_url=ctx.guild.icon or "")
+            
+        if len(pages) == 0:
+            if embed.description == "":
+                embed.description = "> No permissions found."
+            await ctx.send(
+                embed=embed
+            )
+            return
+
+        paginator = SelectPagination(self.bot, ctx.author.id, pages)
+        await ctx.send(
+            embed=pages[0].embeds[0],
+            view=paginator.get_current_view(),
+        )
+    
     @server.command(
         name="pm",
         description="Send a PM to players in your ER:LC server!",
         aliases=["private", "sendpm", "send"],
     )
-    @app_commands.autocomplete(target=erlc_players_autocomplete)
+    @app_commands.autocomplete(target=erlc_group_autocomplete)
     @app_commands.describe(
         target="Who would you like to send this message to?",
         message="What would you like to send?",
@@ -509,6 +1035,23 @@ class ERLC(commands.Cog):
                 ),
                 ephemeral=True,
             )
+
+    @server.command(
+        name="unlink",
+        description="Unlink your ER:LC server from ERM!",
+    )
+    @is_management()
+    @is_server_linked()
+    async def server_unlink(self, ctx: commands.Context):
+        await log_command_usage(self.bot, ctx.guild, ctx.author, f"ER:LC Unlink")
+        await self.bot.server_keys.delete_one({"_id": ctx.guild.id})
+        await ctx.send(
+            embed=discord.Embed(
+                title=f"{self.bot.emoji_controller.get_emoji('success')} Successfully Unlinked",
+                description="I have unlinked your ER:LC server from ERM.",
+                color=GREEN_COLOR,
+            )
+        )
 
     @server.command(
         name="command",
@@ -1090,16 +1633,7 @@ class ERLC(commands.Cog):
             pages.append(page)
 
         paginator = SelectPagination(self.bot, ctx.author.id, pages)
-        try:
-            await ctx.send(embeds=pages[0].embeds, view=paginator.get_current_view())
-        except discord.HTTPException:
-            await ctx.send(
-                embed=discord.Embed(
-                    title="Critical Error",
-                    description="Configuration error; 827",
-                    color=BLANK_COLOR,
-                )
-            )
+        await ctx.send(embeds=pages[0].embeds, view=paginator.get_current_view())
 
     @server.command(
         name="check",
@@ -1108,18 +1642,11 @@ class ERLC(commands.Cog):
     @is_staff()
     @is_server_linked()
     async def check(self, ctx: commands.Context):
-        msg = await ctx.send(
-            embed=discord.Embed(
-                title=f"{self.bot.emoji_controller.get_emoji('Clock')} Checking...",
-                description="This may take a while.",
-                color=BLANK_COLOR,
-            )
-        )
         guild_id = ctx.guild.id
         try:
             players: list[Player] = await self.bot.prc_api.get_server_players(guild_id)
         except ResponseFailure:
-            return await msg.edit(
+            return await ctx.send(
                 embed=discord.Embed(
                     title=f"{self.bot.emoji_controller.get_emoji('WarningIcon')} PRC API Error",
                     description="There was an error fetching players from the PRC API.",
@@ -1128,7 +1655,7 @@ class ERLC(commands.Cog):
             )
 
         if not players:
-            return await msg.edit(
+            return await ctx.send(
                 embed=discord.Embed(
                     title="No Players Found",
                     description="There are no players in the server to check.",
@@ -1136,45 +1663,44 @@ class ERLC(commands.Cog):
                 )
             )
 
-        embed = discord.Embed(
-            title="Players in ER:LC Not in Discord", color=BLANK_COLOR, description=""
-        )
 
+        players_to_members = {}
         for player in players:
-            pattern = re.compile(re.escape(player.username), re.IGNORECASE)
-            member_found = False
+            member = await self.bot.accounts.roblox_to_discord(ctx.guild, player.username, roblox_user_id=player.id)
+            players_to_members[player] = member
 
-            for member in ctx.guild.members:
-                if (
-                    pattern.search(member.name)
-                    or pattern.search(member.display_name)
-                    or (
-                        hasattr(member, "global_name")
-                        and member.global_name
-                        and pattern.search(member.global_name)
-                    )
-                ):
-                    member_found = True
-                    break
+        view = discord.ui.LayoutView()
 
-            if not member_found:
-                try:
-                    discord_id = await get_discord_by_roblox(self.bot, player.username)
-                    if discord_id:
-                        member = ctx.guild.get_member(discord_id)
-                        if member:
-                            member_found = True
-                except discord.HTTPException:
-                    pass
+        players_found = {player: member for player, member in players_to_members.items() if member}
+        players_not_found = [player for player, member in players_to_members.items() if not member]
+        is_staff = {member: await staff_check(self.bot, ctx.guild, member) for member in players_found.values()}
 
-            if not member_found:
-                embed.description += f"> [{player.username}](https://roblox.com/users/{player.id}/profile)\n"
+        class CheckContainer(discord.ui.Container):
+            in_discord = discord.ui.TextDisplay(
+                content="### Players in Discord\n"
+                        + "\n".join(
+                            [f"> {member.mention} - [{player.username}](https://roblox.com/users/{player.id}/profile) {'**(Server Booster)**' if 'Server Booster' in [i.name for i in member.roles] else ''} {'**(Staff)**' if is_staff[member] else ''}"
+                            for player, member in players_found.items()]
+                        )
+            )
 
-        if embed.description == "":
-            embed.description = "> All players are in the Discord server."
+            separator = discord.ui.Separator(
+                spacing=discord.SeparatorSpacing.large
+            )
 
-        embed.set_author(name=ctx.guild.name, icon_url=ctx.guild.icon)
-        await msg.edit(embed=embed)
+            not_in_discord = discord.ui.TextDisplay(
+                content="### Players Not in Discord\n"
+                        + "\n".join(
+                            [f"> [{player.username}](https://roblox.com/users/{player.id}/profile)"
+                            for player in players_not_found]
+                )
+            )
+
+        view.add_item(CheckContainer())
+        await ctx.send(
+            view=view,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
 
     @server.command(
         name="refresh", description="Refresh the author in the ER:LC server."

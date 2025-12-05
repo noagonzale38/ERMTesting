@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import datetime
 import logging
 import re
@@ -8,6 +9,7 @@ import aiohttp
 import discord
 import pytz
 import requests
+from decouple import config
 import roblox.users
 from discord import Embed, InteractionResponse, Webhook
 from discord.ext import commands
@@ -78,6 +80,21 @@ async def generalised_interaction_check_failure(
         )
 
 
+async def has_whitelabel(bot, guild_id: int) -> bool:
+    if (item := await bot.whitelabel.db.find_one({"GuildID": str(guild_id)})) is not None and config("ENVIRONMENT") not in ["ALPHA", "DEVELOPMENT"]:
+        guild = bot.get_guild(guild_id)
+        token = item.get("Token")
+        b64_userid = token.split(".")[0]
+        user_id = base64.b64decode(b64_userid + "==").decode("utf-8")
+        member = guild.get_member(int(user_id))
+        if not member:
+            try:
+                member = await guild.fetch_member(int(user_id))
+            except discord.NotFound:
+                return False
+        return True
+    return False
+
 async def get_roblox_by_username(user: str, bot, ctx: commands.Context):
     if "<@" in user:
         try:
@@ -123,6 +140,41 @@ async def staff_check(bot_obj, guild, member):
         return True
     return False
 
+
+async def admin_check(bot_obj, guild, member):
+    guild_settings = await bot_obj.settings.find_by_id(guild.id)
+    if guild_settings:
+        if "admin_role" in guild_settings["staff_management"].keys():
+            if guild_settings["staff_management"]["admin_role"] != "":
+                if isinstance(guild_settings["staff_management"]["admin_role"], list):
+                    for role in guild_settings["staff_management"]["admin_role"]:
+                        if role in [role.id for role in member.roles]:
+                            return True
+                elif isinstance(guild_settings["staff_management"]["admin_role"], int):
+                    if guild_settings["staff_management"]["admin_role"] in [
+                        role.id for role in member.roles
+                    ]:
+                        return True
+        if "management_role" in guild_settings["staff_management"].keys():
+            if guild_settings["staff_management"]["management_role"] != "":
+                if isinstance(
+                    guild_settings["staff_management"]["management_role"], list
+                ):
+                    for role in guild_settings["staff_management"]["management_role"]:
+                        if role in [role.id for role in member.roles]:
+                            return True
+                elif isinstance(
+                    guild_settings["staff_management"]["management_role"], int
+                ):
+                    if guild_settings["staff_management"]["management_role"] in [
+                        role.id for role in member.roles
+                    ]:
+                        return True
+    if member.guild_permissions.administrator:
+        return True
+    return False
+
+    
 
 def time_converter(parameter: str) -> int:
     conversions = {
@@ -635,7 +687,8 @@ async def secure_logging(
     except discord.HTTPException:
         channel = None
     bloxlink_user = await bot.bloxlink.find_roblox(author_id)
-    # # print(bloxlink_user)
+    if not bloxlink_user: # we'll think of a better solution eventually
+        return
     server_status: ServerStatus = await bot.prc_api.get_server_status(guild_id)
     if channel is not None:
         if not attempted:
