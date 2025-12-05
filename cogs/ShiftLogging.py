@@ -42,7 +42,8 @@ class ShiftLogging(commands.Cog):
         self.bot = bot
 
     @commands.hybrid_group(
-        name="duty"
+        name="duty",
+        aliases=["shift", "shft"]
     ) # hey, maybe dont delete this next time noagonzales.
     async def duty(self, ctx):
         pass
@@ -834,6 +835,7 @@ class ShiftLogging(commands.Cog):
         description="Get the total time worked for the whole of the staff team.",
         extras={"category": "Shift Management"},
         aliases=["lb"],
+        with_app_command=True,
     )
     @require_settings()
     @app_commands.autocomplete(type=all_shift_type_autocomplete)
